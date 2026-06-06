@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -199,6 +200,8 @@ user created with the credentials from options "username" and "password".`,
 		adr := server.Address + ":" + server.Port
 
 		var listener net.Listener
+		var redirectListener net.Listener
+		var redirectSrv *http.Server
 
 		switch {
 		case server.Socket != "":
@@ -223,6 +226,29 @@ user created with the credentials from options "username" and "password".`,
 			if err != nil {
 				return err
 			}
+			redirectListener, err = net.Listen("tcp", server.Address+":80")
+			if err != nil {
+				return err
+			}
+			redirectSrv = &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					host := r.Host
+					if strings.HasSuffix(host, ":80") {
+						host = strings.TrimSuffix(host, ":80")
+					}
+					if server.Port != "443" {
+						if h, _, err := net.SplitHostPort(host); err == nil {
+							host = h
+						}
+						if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+							host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+						}
+						host = net.JoinHostPort(host, server.Port)
+					}
+					http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
+				}),
+				ReadHeaderTimeout: 60 * time.Second,
+			}
 		default:
 			listener, err = net.Listen("tcp", adr)
 			if err != nil {
@@ -241,6 +267,9 @@ user created with the credentials from options "username" and "password".`,
 		}
 
 		defer listener.Close()
+		if redirectListener != nil {
+			defer redirectListener.Close()
+		}
 
 		log.Println("Listening on", listener.Addr().String())
 		srv := &http.Server{
@@ -255,6 +284,17 @@ user created with the credentials from options "username" and "password".`,
 
 			log.Println("Stopped serving new connections.")
 		}()
+
+		if redirectSrv != nil {
+			log.Println("Listening for HTTP redirects on", redirectListener.Addr().String())
+			go func() {
+				if err := redirectSrv.Serve(redirectListener); !errors.Is(err, http.ErrServerClosed) {
+					log.Fatalf("HTTP redirect server error: %v", err)
+				}
+
+				log.Println("Stopped serving new redirect connections.")
+			}()
+		}
 
 		sigc := make(chan os.Signal, 1)
 		signal.Notify(sigc,
@@ -272,6 +312,11 @@ user created with the credentials from options "username" and "password".`,
 
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			log.Fatalf("HTTP shutdown error: %v", err)
+		}
+		if redirectSrv != nil {
+			if err := redirectSrv.Shutdown(shutdownCtx); err != nil {
+				log.Fatalf("HTTP redirect shutdown error: %v", err)
+			}
 		}
 		log.Println("Graceful shutdown complete.")
 
